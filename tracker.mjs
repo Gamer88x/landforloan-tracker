@@ -137,27 +137,33 @@ const saveState = (s) => writeFile(STATE_FILE, JSON.stringify(s, null, 1) + '\n'
 const thaiDate = (d = new Date()) =>
   d.toLocaleDateString('th-TH', { timeZone: 'Asia/Bangkok', weekday: 'long', day: 'numeric', month: 'long', year: 'numeric' });
 
-// อ่านหน้าเว็บตามลำดับ: เว็บเรียงทรัพย์ว่างไว้ก่อนเสมอ แล้วตามด้วยทรัพย์ที่ปิดดีล (รูปปก MATCH)
-// เก็บรหัสโพสต์ไปเรื่อยๆ จนเจอการ์ดแรกที่เป็น MATCH แล้วหยุด
+// อ่านหน้าเว็บตามลำดับ ทรัพย์ว่าง = รูปปกไม่ใช่ MATCH และการ์ดยังแสดงวงเงินขายฝาก/จำนอง
+// ทรัพย์ว่างอยู่ช่วงหน้าแรกๆ จึงหยุดเมื่อเจอหน้าแรกที่ไม่มีทรัพย์ว่างเลย
 async function fetchOpenIdsFromSite() {
   const ids = [];
   for (let p = 1; p <= 20; p++) {
     const r = await fetch(`https://landforloan.co.th/assets-new/${p > 1 ? p + '/' : ''}`, { headers: UA });
     if (!r.ok) throw new Error(`assets-new page ${p}: ${r.status}`);
     const cards = (await r.text()).split('<article id="post-').slice(1);
-    if (!cards.length) break;
+    if (!cards.length) {
+      if (p === 1) throw new Error('อ่านหน้าเว็บไม่ได้ — ข้ามรอบนี้');
+      break;
+    }
+    let found = 0;
     for (const c of cards) {
       const img = (c.match(/data-src="([^"]+)"/) || c.match(/src="(https[^"]+)"/) || [])[1] || '';
-      if (/m\W?a?\W?tch/i.test(decodeURIComponent(img.split('/').pop()))) return ids;
-      ids.push(Number(c.match(/^\d+/)[0]));
+      const matched = /m\W?a?\W?tch/i.test(decodeURIComponent(img.split('/').pop()));
+      const hasAmount = /วงเงิน(ขายฝาก|จำนอง)\s*[\d,]+/.test(c);
+      if (!matched && hasAmount) { ids.push(Number(c.match(/^\d+/)[0])); found++; }
     }
+    if (!found) break;
   }
   return ids;
 }
 
 async function loadOpenListings() {
   const ids = await fetchOpenIdsFromSite();
-  if (!ids.length) throw new Error('อ่านหน้าเว็บไม่ได้ / ไม่พบทรัพย์ว่าง — ข้ามรอบนี้');
+  if (!ids.length) return [];
   return (await attachCovers(await fetchByIds(ids))).map(normalize);
 }
 
