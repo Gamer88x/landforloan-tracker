@@ -1,0 +1,56 @@
+name: Land for Loan tracker
+
+on:
+  schedule:
+    - cron: '55 23 * * *'   # 06:55 น. เวลาไทย → สรุปทรัพย์ (สคริปต์รอจนถึง 07:00)
+    - cron: '15,45 * * * *' # ทุก 30 นาที → เช็คทรัพย์ใหม่ / ปิดดีล
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'morning = ส่งสรุปทั้งหมด, watch = เช็คการเปลี่ยนแปลง'
+        default: watch
+        type: choice
+        options: [watch, morning]
+
+concurrency:
+  group: tracker
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Pick mode
+        id: mode
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then echo "mode=${{ inputs.mode }}" >> "$GITHUB_OUTPUT"
+          elif [ "${{ github.event.schedule }}" = "55 23 * * *" ]; then echo "mode=morning" >> "$GITHUB_OUTPUT"
+          else echo "mode=watch" >> "$GITHUB_OUTPUT"; fi
+
+      - name: Wait until 07:00 (Bangkok)
+        if: steps.mode.outputs.mode == 'morning' && github.event_name == 'schedule'
+        run: |
+          target=$(TZ=Asia/Bangkok date -d 'today 07:00' +%s); now=$(date +%s)
+          [ "$now" -lt "$target" ] && sleep $((target - now)) || true
+
+      - name: Run tracker
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: node tracker.mjs ${{ steps.mode.outputs.mode }}
+
+      - name: Save state
+        run: |
+          git config user.name "tracker-bot"
+          git config user.email "tracker-bot@users.noreply.github.com"
+          git add state.json
+          git diff --cached --quiet || (git commit -m "update state" && git push)
