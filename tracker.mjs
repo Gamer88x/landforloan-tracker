@@ -4,6 +4,7 @@
 // env:   TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, DRY_RUN=1 (พิมพ์ออกจอแทนการส่ง)
 
 import { readFile, writeFile } from 'node:fs/promises';
+import { execSync } from 'node:child_process';
 
 const API = 'https://landforloan.co.th/wp-json/wp/v2';
 const UA = { 'user-agent': 'Mozilla/5.0 (LandForLoan-Telegram-Tracker)' };
@@ -193,16 +194,52 @@ async function watch(state, current) {
   console.log(`ทรัพย์ใหม่ ${fresh.length}, ปิดดีล ${goneIds.length}, ว่างอยู่ ${current.length}`);
 }
 
-const state = await loadState();
-const current = await loadOpenListings();
-if (!state || state.version !== 2) {
-  // รันครั้งแรก: จำทรัพย์ปัจจุบันไว้ก่อน ไม่ส่งแจ้งเตือนย้อนหลัง
-  console.log(`เริ่มต้นระบบ: จำทรัพย์ว่าง ${current.length} ทรัพย์`);
-} else {
-  await watch(state, current);
-}
-if (MODE === 'morning') await morning(current);
+const bkkDate = () => new Date(Date.now() + 7 * 3600e3).toISOString().slice(0, 10);
+const bkkHour = () => new Date(Date.now() + 7 * 3600e3).getUTCHours();
 
-const known = new Set([...(state?.known ?? []), ...current.map((l) => l.id)]);
-const next = { version: 2, open: Object.fromEntries(current.map((l) => [l.id, l.code])), known: [...known] };
-if (!DRY_RUN || process.env.SAVE_STATE === '1') await saveState(next);
+async function runOnce(mode) {
+  const state = await loadState();
+  const current = await loadOpenListings();
+  if (!state || state.version !== 2) {
+    // รันครั้งแรก: จำทรัพย์ปัจจุบันไว้ก่อน ไม่ส่งแจ้งเตือนย้อนหลัง
+    console.log(`เริ่มต้นระบบ: จำทรัพย์ว่าง ${current.length} ทรัพย์`);
+  } else {
+    await watch(state, current);
+  }
+  let lastMorning = state?.lastMorning;
+  // สรุปเช้า: สั่งเอง (morning) หรือในโหมด loop เมื่อถึง 07:00 และวันนี้ยังไม่ได้ส่ง
+  if (mode === 'morning' || (mode === 'loop' && bkkHour() >= 7 && lastMorning !== bkkDate())) {
+    await morning(current);
+    lastMorning = bkkDate();
+  }
+  const known = new Set([...(state?.known ?? []), ...current.map((l) => l.id)]);
+  const next = { version: 2, lastMorning, open: Object.fromEntries(current.map((l) => [l.id, l.code])), known: [...known] };
+  if (!DRY_RUN || process.env.SAVE_STATE === '1') await saveState(next);
+}
+
+// บันทึก state.json กลับเข้า repo (เฉพาะตอนรันบน GitHub Actions)
+function commitState() {
+  if (!process.env.GITHUB_ACTIONS) return;
+  const sh = (c) => execSync(c, { stdio: 'inherit' });
+  sh('git add state.json');
+  try { execSync('git diff --cached --quiet'); } catch { sh('git commit -m "update state" && git pull --rebase -q && git push'); }
+}
+
+if (MODE === 'loop') {
+  // รันค้างไว้ เช็คทุก 5 นาที จนครบ ~5 ชม. 45 นาที (GitHub จำกัดงานละ 6 ชม.) แล้ว workflow จะเริ่มรอบใหม่ต่อเอง
+  const end = Date.now() + (Number(process.env.LOOP_MINUTES) || 345) * 60e3;
+  while (Date.now() < end) {
+    const started = Date.now();
+    try {
+      await runOnce('loop');
+      commitState();
+    } catch (e) {
+      console.error(`รอบนี้ผิดพลาด: ${e.message}`);
+    }
+    const wait = 5 * 60e3 - (Date.now() - started);
+    if (Date.now() + wait >= end) break;
+    if (wait > 0) await sleep(wait);
+  }
+} else {
+  await runOnce(MODE);
+}

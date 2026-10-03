@@ -1,57 +1,65 @@
 name: Land for Loan tracker
-# schedule refresh 2026-10-03
 
+# โหมด loop รันค้างไว้ เช็คทุก 5 นาที + ส่งสรุป 07:00 ทุกวัน
+# ใกล้ครบเวลา (~6 ชม.) จะสั่งเริ่มรอบใหม่ต่อเอง ไม่ต้องพึ่งตัวตั้งเวลาของ GitHub
 on:
   schedule:
-    - cron: '55 23 * * *'   # 06:55 น. เวลาไทย → สรุปทรัพย์ (สคริปต์รอจนถึง 07:00)
-    - cron: '*/5 * * * *'   # ทุก 5 นาที → เช็คทรัพย์ใหม่ / ปิดดีล
+    - cron: '7 * * * *' # สำรอง: ทุกชั่วโมง ถ้าไม่มีรอบไหนรันอยู่ จะเริ่มรอบ loop ใหม่
   workflow_dispatch:
     inputs:
       mode:
-        description: 'morning = ส่งสรุปทั้งหมด, watch = เช็คการเปลี่ยนแปลง'
-        default: watch
+        description: 'loop = เฝ้าต่อเนื่อง, morning = ส่งสรุปทันที, watch = เช็ครอบเดียว'
+        default: loop
         type: choice
-        options: [watch, morning]
-
-concurrency:
-  group: tracker
-  cancel-in-progress: false
+        options: [loop, morning, watch]
 
 permissions:
   contents: write
+  actions: write
 
 jobs:
-  run:
+  keeper:
+    if: github.event_name == 'schedule'
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    steps:
+      - name: Start loop if none running
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          active=$(gh run list -R "$GITHUB_REPOSITORY" -w tracker.yml -e workflow_dispatch --json status -q '[.[] | select(.status=="in_progress" or .status=="queued")] | length')
+          if [ "$active" = "0" ]; then gh workflow run tracker.yml -R "$GITHUB_REPOSITORY" -f mode=loop; fi
+
+  run:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    concurrency:
+      group: tracker-${{ inputs.mode == 'loop' && 'loop' || 'once' }}
+      cancel-in-progress: false
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-
-      - name: Pick mode
-        id: mode
+      - name: Git identity
         run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then echo "mode=${{ inputs.mode }}" >> "$GITHUB_OUTPUT"
-          elif [ "${{ github.event.schedule }}" = "55 23 * * *" ]; then echo "mode=morning" >> "$GITHUB_OUTPUT"
-          else echo "mode=watch" >> "$GITHUB_OUTPUT"; fi
-
-      - name: Wait until 07:00 (Bangkok)
-        if: steps.mode.outputs.mode == 'morning' && github.event_name == 'schedule'
-        run: |
-          target=$(TZ=Asia/Bangkok date -d 'today 07:00' +%s); now=$(date +%s)
-          [ "$now" -lt "$target" ] && sleep $((target - now)) || true
+          git config user.name "tracker-bot"
+          git config user.email "tracker-bot@users.noreply.github.com"
 
       - name: Run tracker
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: node tracker.mjs ${{ steps.mode.outputs.mode }}
+        run: node tracker.mjs ${{ inputs.mode }}
 
       - name: Save state
+        if: inputs.mode != 'loop'
         run: |
-          git config user.name "tracker-bot"
-          git config user.email "tracker-bot@users.noreply.github.com"
           git add state.json
-          git diff --cached --quiet || (git commit -m "update state" && git push)
+          git diff --cached --quiet || (git commit -m "update state" && git pull --rebase -q && git push)
+
+      - name: Start next loop
+        if: always() && inputs.mode == 'loop'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run tracker.yml -R "$GITHUB_REPOSITORY" -f mode=loop
