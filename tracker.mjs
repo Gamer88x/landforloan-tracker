@@ -30,28 +30,11 @@ async function getJSON(url) {
 
 const FIELDS = '_fields=id,date,link,title,acf,featured_media';
 
-async function fetchAllListings() {
-  const first = await getJSON(`${API}/listing?per_page=100&page=1&${FIELDS}`);
-  const pages = Number(first.headers.get('x-wp-totalpages') || 1);
-  let all = first.data;
-  for (let p = 2; p <= pages; p++) all = all.concat((await getJSON(`${API}/listing?per_page=100&page=${p}&${FIELDS}`)).data);
-  return all;
-}
-
 async function fetchByIds(ids) {
   let out = [];
   for (let i = 0; i < ids.length; i += 100)
     out = out.concat((await getJSON(`${API}/listing?per_page=100&include=${ids.slice(i, i + 100).join(',')}&${FIELDS}`)).data);
   return out;
-}
-
-async function fetchModifiedSince(isoLocal) {
-  let out = [];
-  for (let p = 1; ; p++) {
-    const { data, headers } = await getJSON(`${API}/listing?per_page=100&page=${p}&orderby=modified&modified_after=${encodeURIComponent(isoLocal)}&${FIELDS}`);
-    out = out.concat(data);
-    if (p >= Number(headers.get('x-wp-totalpages') || 1)) return out;
-  }
 }
 
 async function attachCovers(listings) {
@@ -153,65 +136,67 @@ const saveState = (s) => writeFile(STATE_FILE, JSON.stringify(s, null, 1) + '\n'
 
 const thaiDate = (d = new Date()) =>
   d.toLocaleDateString('th-TH', { timeZone: 'Asia/Bangkok', weekday: 'long', day: 'numeric', month: 'long', year: 'numeric' });
-// เวลาไทย แบบ ISO ไม่มี timezone (WordPress ใช้เวลาท้องถิ่นของเว็บ)
-const bkkIso = (d) => new Date(d.getTime() + 7 * 3600e3).toISOString().slice(0, 19);
 
-async function morning(state) {
-  const all = (await attachCovers(await fetchAllListings())).map(normalize);
-  const open = sortListings(all.filter((l) => l.open));
-  const n = (t) => open.filter((l) => l.type === t).length;
-  await sendText(
-    `🌅 <b>อัปเดตทรัพย์ Land for Loan</b>\n${thaiDate()}\n\nทรัพย์ที่เปิดรับนักลงทุน ${open.length} ทรัพย์\n• ขายฝาก ${n('ขายฝาก')} ทรัพย์\n• จำนอง ${n('จำนอง')} ทรัพย์`
-  );
-  for (const [i, l] of open.entries()) await sendListing(l, `รหัสทรัพย์ที่ ${i + 1} ${l.code}`);
-  return { open: Object.fromEntries(open.map((l) => [l.id, l.code])), known: all.map((l) => l.id) };
+// อ่านหน้าเว็บตามลำดับ: เว็บเรียงทรัพย์ว่างไว้ก่อนเสมอ แล้วตามด้วยทรัพย์ที่ปิดดีล (รูปปก MATCH)
+// เก็บรหัสโพสต์ไปเรื่อยๆ จนเจอการ์ดแรกที่เป็น MATCH แล้วหยุด
+async function fetchOpenIdsFromSite() {
+  const ids = [];
+  for (let p = 1; p <= 20; p++) {
+    const r = await fetch(`https://landforloan.co.th/assets-new/${p > 1 ? p + '/' : ''}`, { headers: UA });
+    if (!r.ok) throw new Error(`assets-new page ${p}: ${r.status}`);
+    const cards = (await r.text()).split('<article id="post-').slice(1);
+    if (!cards.length) break;
+    for (const c of cards) {
+      const img = (c.match(/data-src="([^"]+)"/) || c.match(/src="(https[^"]+)"/) || [])[1] || '';
+      if (/m\W?a?\W?tch/i.test(decodeURIComponent(img.split('/').pop()))) return ids;
+      ids.push(Number(c.match(/^\d+/)[0]));
+    }
+  }
+  return ids;
 }
 
-async function watch(state) {
-  const since = new Date(Date.parse(state.lastRun) - 6 * 3600e3); // เผื่อเวลาซ้อนทับ กันหลุด
-  const changed = await fetchModifiedSince(bkkIso(since));
-  // ตรวจทรัพย์ที่เคยเปิดอยู่ด้วย เผื่อถูกลบ/ซ่อนจากเว็บ
-  const openIds = Object.keys(state.open).map(Number);
-  const stillThere = await fetchByIds(openIds);
-  const byId = new Map([...stillThere, ...changed].map((x) => [x.id, x]));
-  const current = (await attachCovers([...byId.values()])).map(normalize);
+async function loadOpenListings() {
+  const ids = await fetchOpenIdsFromSite();
+  if (!ids.length) throw new Error('อ่านหน้าเว็บไม่ได้ / ไม่พบทรัพย์ว่าง — ข้ามรอบนี้');
+  return (await attachCovers(await fetchByIds(ids))).map(normalize);
+}
 
+async function morning(open) {
+  open = sortListings(open ?? (await loadOpenListings()));
+  const n = (t) => open.filter((l) => l.type === t).length;
+  await sendText(
+    `🌅 <b>อัปเดตทรัพย์ Land for Loan</b>\n${thaiDate()}\n\nทรัพย์ว่าง เปิดรับนักลงทุน ${open.length} ทรัพย์\n• ขายฝาก ${n('ขายฝาก')} ทรัพย์\n• จำนอง ${n('จำนอง')} ทรัพย์`
+  );
+  for (const [i, l] of open.entries()) await sendListing(l, `รหัสทรัพย์ที่ ${i + 1} ${l.code}`);
+}
+
+async function watch(state, current) {
+  const nowIds = new Set(current.map((l) => l.id));
   const known = new Set(state.known);
-  const open = { ...state.open };
-  const fresh = sortListings(current.filter((l) => l.open && !(l.id in open)));
-  const closed = [];
-  for (const id of openIds) {
-    const l = current.find((c) => c.id === id);
-    if (!l || !l.open) closed.push(l || { id, code: state.open[id], missing: true });
-  }
+  const fresh = sortListings(current.filter((l) => !(l.id in state.open)));
+  const goneIds = Object.keys(state.open).map(Number).filter((id) => !nowIds.has(id));
+  const gone = goneIds.length ? (await attachCovers(await fetchByIds(goneIds))).map(normalize) : [];
 
-  for (const l of fresh) {
-    await sendListing(l, `${known.has(l.id) ? '🔄 ทรัพย์กลับมาเปิดรับ' : '🆕 ทรัพย์ใหม่'}\nรหัสทรัพย์ ${l.code}`);
-    open[l.id] = l.code;
+  for (const l of fresh)
+    await sendListing(l, `${known.has(l.id) ? '🔄 ทรัพย์กลับมาว่าง' : '🆕 ทรัพย์ใหม่'}\nรหัสทรัพย์ ${l.code}`);
+  for (const id of goneIds) {
+    const l = gone.find((g) => g.id === id);
+    if (l) await sendListing(l, `✅ ปิดดีลแล้ว (MATCH)\nรหัสทรัพย์ ${l.code}`);
+    else await sendText(`✅ <b>ปิดดีลแล้ว / นำออกจากเว็บ</b>\nรหัสทรัพย์ ${esc(state.open[id])}`);
   }
-  for (const l of closed) {
-    if (l.missing) await sendText(`✅ <b>ปิดดีลแล้ว / นำออกจากเว็บ</b>\nรหัสทรัพย์ ${esc(l.code)}`);
-    else await sendListing(l, `✅ ปิดดีลแล้ว (MATCH)\nรหัสทรัพย์ ${l.code}`);
-    delete open[l.id];
-  }
-  for (const l of current) known.add(l.id);
-  console.log(`ทรัพย์ใหม่ ${fresh.length}, ปิดดีล ${closed.length}, เปิดอยู่ ${Object.keys(open).length}`);
-  return { open, known: [...known] };
+  console.log(`ทรัพย์ใหม่ ${fresh.length}, ปิดดีล ${goneIds.length}, ว่างอยู่ ${current.length}`);
 }
 
 const state = await loadState();
-let next;
-if (!state) {
-  // รันครั้งแรก: จำทรัพย์ปัจจุบันไว้ก่อน ไม่ส่งแจ้งเตือนย้อนหลัง (ยกเว้นสั่ง morning)
-  if (MODE === 'morning') next = await morning();
-  else {
-    const all = (await attachCovers(await fetchAllListings())).map(normalize);
-    next = { open: Object.fromEntries(all.filter((l) => l.open).map((l) => [l.id, l.code])), known: all.map((l) => l.id) };
-    console.log(`เริ่มต้นระบบ: จำทรัพย์ที่เปิดอยู่ ${Object.keys(next.open).length} ทรัพย์`);
-  }
+const current = await loadOpenListings();
+if (!state || state.version !== 2) {
+  // รันครั้งแรก: จำทรัพย์ปัจจุบันไว้ก่อน ไม่ส่งแจ้งเตือนย้อนหลัง
+  console.log(`เริ่มต้นระบบ: จำทรัพย์ว่าง ${current.length} ทรัพย์`);
 } else {
-  // ตอนเช้าเช็คความเปลี่ยนแปลงข้ามคืนก่อน แล้วค่อยส่งสรุปทั้งหมด
-  next = await watch(state);
-  if (MODE === 'morning') next = await morning();
+  await watch(state, current);
 }
+if (MODE === 'morning') await morning(current);
+
+const known = new Set([...(state?.known ?? []), ...current.map((l) => l.id)]);
+const next = { version: 2, open: Object.fromEntries(current.map((l) => [l.id, l.code])), known: [...known] };
 if (!DRY_RUN || process.env.SAVE_STATE === '1') await saveState({ lastRun: new Date().toISOString(), ...next });
