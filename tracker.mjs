@@ -199,4 +199,4 @@ if (MODE === 'morning') await morning(current);
 
 const known = new Set([...(state?.known ?? []), ...current.map((l) => l.id)]);
 const next = { version: 2, open: Object.fromEntries(current.map((l) => [l.id, l.code])), known: [...known] };
-if (!DRY_RUN || process.env.SAVE_STATE === '1') await saveState({ lastRun: new Date().toISOString(), ...next });
+if (!DRY_RUN || process.env.SAVE_STATE === '1') await saveState(next);
